@@ -1,0 +1,13 @@
+ale_py
+gym
+matplotlib
+numpy==1.24.3
+optuna
+pynput
+tqdm
+deap
+optuna
+opencv-python
+ale-py
+gym[atari]
+gym[accept-rom-license]
