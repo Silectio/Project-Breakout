@@ -11,4 +11,3 @@ opencv-python
 ale-py
 gym[atari]
 gym[accept-rom-license]
-pygraphviz
