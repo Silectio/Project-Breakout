@@ -37,71 +37,116 @@ def on_release(key):
 listener = keyboard.Listener(on_press=on_press, on_release=on_release)
 listener.start()
 
+import gym
+import random
+import numpy as np
+from gym import Wrapper
+from gym.spaces import Discrete, Box
+
 class EnvBreakout(Wrapper):
-    def __init__(self, render_mode=None, clipping=True,negative_reward=True, featureTuning=False):
-        self.env = gym.make('ALE/Breakout-ram-v5',
+    def __init__(self, render_mode=None, clipping=True, negative_reward=True):
+        # Create the underlying Atari Breakout env
+        self.env = gym.make('Breakout-ram-v4',
                             full_action_space=False,
                             frameskip=4,
-                            render_mode=render_mode
-                            )
+                            render_mode=render_mode)
+        super().__init__(self.env)
         self.clipping = clipping
-        # Three actions: 0 -> NO-OP, 1 -> LEFT, 2 -> RIGHT
-        self.action_space = Discrete(3)
-        # Mapping: NO-OP (0), LEFT (2), RIGHT (3)
-        self.action_mapper = {0: 0, 1: 2, 2: 3}
-        if featureTuning:
-            self.observation_space = Box(low=0, high=255, shape=(13,), dtype=np.uint8)
-        else:
-            self.observation_space = Box(low=0, high=255, shape=(128,), dtype=np.uint8)
-        self.metadata = self.env.metadata
-        self.num_lives = 5
         self.negative_reward = negative_reward
-        self.featureTuning = featureTuning
 
-    def reset(self):
-        obs, info = self.env.reset(seed=random.randint(0, 128))
+        # Reduced 3-action space:
+        #   0 -> NO-OP
+        #   1 -> LEFT
+        #   2 -> RIGHT
+        # Mapped to underlying ALE actions: NO-OP=0, LEFT=2, RIGHT=3
+        self.action_space = Discrete(3)
+        self.action_mapper = {0: 0, 1: 2, 2: 3}
+
+        # Same shape, but we use raw RAM for illustration
+        self.observation_space = Box(low=0, high=255, shape=(128,), dtype=np.uint8)
+        self.metadata = self.env.metadata
+
+        # Track how many lives are left
         self.num_lives = 5
-        # Press FIRE to start the game (action 1 corresponds to FIRE in ALE)
-        obs, _, done, truncated, info = self.env.step(1)
-        obs = EnvBreakout.RAM_Obs(obs, self.featureTuning)
-        return obs, info
+
+        # A flag that tells us whether we need to press FIRE after losing a life
+        self._need_fire = False
+
+    def reset(self, *, seed=None, options=None):
+        obs, info = self.env.reset(seed=random.randint(0, 9999))
+        self.num_lives = 5
+
+        # Press FIRE to start the game
+        obs, real_r, done, truncated, info = self.env.step(1)
+        return self.RAM_Obs(obs), info
 
     def step(self, action, return_real_reward=False):
+        """
+        Performs the agent's intended action (left/right/no-op).
+        If a life was lost (and there are still lives left), sets a flag that
+        we need to FIRE on the *next* call to 'step_fire_if_needed'.
+        """
+
         mapped_action = self.action_mapper[action]
         obs, real_reward, done, truncated, info = self.env.step(mapped_action)
-        reward = np.clip(real_reward, -1, 1) if self.clipping else real_reward
 
-        remaining_lives = info.get('lives', self.num_lives)
-        if remaining_lives == 0:
-            done = True
-        elif remaining_lives < self.num_lives:
-            self.num_lives = remaining_lives
-            done2 = False
-            truncated2 = False
-            obs, real_reward2, done2, truncated2, info = self.env.step(1)
-            if self.negative_reward:
-                reward = -1
-            real_reward += real_reward2
-            done = done or done2
-            truncated = truncated or truncated2
-            
-        obs = EnvBreakout.RAM_Obs(obs, self.featureTuning)
-        if return_real_reward:
-            return obs, reward, done, truncated, info, real_reward
-        return obs, reward, done, truncated, info
-
-    def RAM_Obs(obs,featureTuning=False):
-        if featureTuning:
-            observation_ramF = obs[[70, 71, 72, 74, 75, 90, 94, 95, 99, 101, 103, 105, 119]]
-            return observation_ramF
+        # Possibly clip the environment's reward
+        if self.clipping:
+            reward = np.clip(real_reward, -1, 1)
         else:
-            return obs
-    
-    def render(self):
-        return self.env.render()
+            reward = real_reward
+
+        # Check if a life was lost
+        remaining_lives = info.get('lives', self.num_lives)
+        lost_life = (remaining_lives < self.num_lives)
+        self.num_lives = remaining_lives
+
+        if lost_life and remaining_lives > 0 and not done and not truncated:
+            # Apply the negative penalty (if requested)
+            if self.negative_reward:
+                reward += -1
+            # Mark that we must FIRE on the next call to step_fire_if_needed()
+            self._need_fire = True
+
+        # If no more lives, or the ALE says game is over
+        if remaining_lives == 0 or done or truncated:
+            done = True
+
+        # Return real_reward as well if asked
+        if return_real_reward:
+            return self.RAM_Obs(obs), reward, done, truncated, info, real_reward
+        else:
+            return self.RAM_Obs(obs), reward, done, truncated, info
+
+    def step_fire_if_needed(self, return_real_reward=False):
+        """
+        If a life was lost in the previous transition (and we still have lives),
+        do the forced 'FIRE' step here, returning its new observation/reward.
+        Otherwise, return None.
+        """
+        if self._need_fire:
+            self._need_fire = False
+            obs, real_reward, done, truncated, info = self.env.step(1)
+            if self.clipping:
+                reward = np.clip(real_reward, -1, 1)
+            else:
+                reward = real_reward
+
+            if return_real_reward:
+                return self.RAM_Obs(obs), reward, done, truncated, info, real_reward
+            else:
+                return self.RAM_Obs(obs), reward, done, truncated, info
+
+        return None
 
     def close(self):
         self.env.close()
+
+    @staticmethod
+    def RAM_Obs(obs):
+        # If you ever want to filter or reshape the RAM, do it here.
+        return obs
+
 
 def collect_human_imitation_dataset(env, num_episodes=10, max_steps=5000, dataset_file='human_imitation_dataset.pkl'):
     """
@@ -190,3 +235,5 @@ if __name__ == '__main__':
     env = EnvBreakout(render_mode='human', clipping=True)
     collect_human_imitation_dataset(env, num_episodes=50, dataset_file='human_imitation_dataset.pkl')
     env.close()
+    
+
