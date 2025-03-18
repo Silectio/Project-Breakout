@@ -26,10 +26,10 @@ def compute_epsilon_decay(eps_start, eps_end, num_episodes):
 
 class DDQNAgent:
     def __init__(
-        self, state_size, action_size, gamma=0.99, lr=3e-4,
+        self, state_size, action_size, gamma=0.99, lr=1e-3,
         batch_size=128, max_memory=500, epsilon=1.0,
         epsilon_min=0.01, epsilon_decay=0.99965, max_grad_norm=1.0,
-        target_update_interval=2000, demo_ratio = 0
+        target_update_interval=2000
     ):
         self.state_size = state_size
         self.action_size = action_size
@@ -41,17 +41,17 @@ class DDQNAgent:
         self.max_grad_norm = max_grad_norm
         self.target_update_interval = target_update_interval
         self.learn_steps = 0
-        self.demo_ratio = demo_ratio
+        self.demo_ratio = 0.8
         self.loss = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Online network
-        self.model = ModularMLP(input_dim=state_size, output_dim=action_size, num_hidden_layers=3, hidden_dim=64).to(self.device)
+        self.model = ModularMLP(input_dim=state_size, output_dim=action_size, num_hidden_layers=2, hidden_dim=16).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=100000, gamma=0.5)
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=50000, gamma=0.5)
 
         # Target network
-        self.target_model = ModularMLP(input_dim=state_size, output_dim=action_size, num_hidden_layers=3, hidden_dim=64).to(self.device)
+        self.target_model = ModularMLP(input_dim=state_size, output_dim=action_size, num_hidden_layers=2, hidden_dim=16).to(self.device)
         self.update_target_network()  # copy weights initially
         self.target_model.eval()
 
@@ -104,7 +104,7 @@ class DDQNAgent:
         et un sous-ensemble des transitions classiques de replay.
         """
         # Empêche de démarrer l'entraînement si peu de données
-        if len(self.memory) < self.batch_size :
+        if len(self.memory) < self.batch_size // 2:
             return
 
         
@@ -136,7 +136,7 @@ class DDQNAgent:
         states, actions, rewards, next_states, dones = zip(*batch)
         states_t      = torch.stack(states).to(self.device)
         actions_t     = torch.stack(actions).to(self.device)
-        rewards_t     = torch.stack(rewards).clip(-1,0.1).to(self.device)
+        rewards_t     = torch.stack(rewards).clip(-1,1).to(self.device)
         next_states_t = torch.stack(next_states).to(self.device)
         dones_t       = torch.stack(dones).to(self.device)
 
@@ -164,9 +164,8 @@ class DDQNAgent:
         # Mise à jour des priorités
         new_priorities = np.abs(td_errors.detach().cpu().numpy()) + 1e-5
 
-        if batch_size_main > 0 :
-            # MàJ des priorités de la mémoire principale
-            self.memory.update_priorities(indices_main, new_priorities[:batch_size_main])
+        # MàJ des priorités de la mémoire principale
+        self.memory.update_priorities(indices_main, new_priorities[:batch_size_main])
         
         # S'il y a une partie démonstration, mettre à jour aussi leurs priorités
         if batch_size_demo > 0:
@@ -202,31 +201,6 @@ import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from datetime import timedelta
-
-
-def print_agent_vs_env(agent : DDQNAgent):
-    env = EnvBreakout(render_mode='human')
-    step = 0
-    done = False
-    truncated = False
-    state, _ = env.reset()
-    while step < 100000 or not done:
-        action = agent.act(state, eval_mode=True)
-        state, reward, done, truncated, info = env.step(action)
-        
-        env.render()
-        time.sleep(0.01)
-        
-        step +=1
-        
-        fire_result = env.step_fire_if_needed(return_real_reward=True)
-        if fire_result is not None:
-            state, reward, done, truncated, info, real_reward = fire_result
-        if done or truncated :
-            break
-        
-    env.close()
-    return
 
 def train_no_parallel(agent : DDQNAgent, env : EnvBreakout, total_episodes=10000, random_episodes=1000):
     print("cuda" if torch.cuda.is_available() else "cpu")
@@ -269,7 +243,6 @@ def train_no_parallel(agent : DDQNAgent, env : EnvBreakout, total_episodes=10000
             action = agent.act(state)
             next_state, reward, done, truncated, _, real_reward = env.step(action, return_real_reward=True)
 
-
             # Récupération de la perte si définie
             if agent.loss is not None:
                 avg_loss += agent.loss
@@ -287,12 +260,8 @@ def train_no_parallel(agent : DDQNAgent, env : EnvBreakout, total_episodes=10000
             # Limite arbitraire sur le nombre de pas par épisode
             if step_count >= 10000:
                 break
-            fire_result = env.step_fire_if_needed(return_real_reward=True)
-            if fire_result is not None:
-                next_state, reward, done, truncated, info, real_reward = fire_result
                 
-        if agent.demo_ratio >0:
-            agent.demo_ratio = max(0.1, agent.demo_ratio * compute_epsilon_decay(0.5,0.05 , 500))
+        agent.demo_ratio = max(0.1, agent.demo_ratio * compute_epsilon_decay(0.5,0.1 , 500))
         # Fin de l'épisode
         completed_episodes += 1
         pbar.update(1)
@@ -381,9 +350,6 @@ def train_no_parallel(agent : DDQNAgent, env : EnvBreakout, total_episodes=10000
             plt.tight_layout()
             fig.savefig('training_plot_single.png')
             plt.close()
-        
-        if completed_episodes%100 ==  0 : 
-            print_agent_vs_env(agent=agent)
 
     pbar.close()
     print("\nEntraînement terminé !")
@@ -492,7 +458,7 @@ def train_no_parallel_mute(agent : DDQNAgent, env : EnvBreakout, total_episodes=
     return reward_list
 
 
-def train_parallel(agent, envs, total_episodes = 10000, random_episodes = 1000, num_envs=4, print_step = 10):
+def train_parallel(agent, envs, total_episodes = 10000, random_episodes = 1000, num_envs=4):
     print("cuda" if torch.cuda.is_available() else "cpu")
 
     # Nombre d'environnements parallèles
@@ -589,7 +555,7 @@ def train_parallel(agent, envs, total_episodes = 10000, random_episodes = 1000, 
             if done_flags[i] or truncated_flags[i] or (step_counts[i] >= 10000):
                 completed_episodes += 1
                 pbar.update(1)
-                agent.demo_ratio = max(0.05, agent.demo_ratio * compute_epsilon_decay(0.5,0.05 , total_episodes))
+                agent.demo_ratio = max(0.1, agent.demo_ratio * compute_epsilon_decay(1,0.1 , total_episodes))
                 if completed_episodes >= random_episodes:
                     agent.update_epsilon()
                 if ep_real_rewards[i] > 850:
@@ -603,7 +569,7 @@ def train_parallel(agent, envs, total_episodes = 10000, random_episodes = 1000, 
                 reward_list.append(episode_reward)
                 step_count_list.append(episode_steps)
 
-                if (completed_episodes > 0) and completed_episodes % print_step ==0:
+                if (completed_episodes > 0) and completed_episodes % 10 ==0:
                     elapsed_time = time.time() - start_time
                     print(f"\nFin épisode {completed_episodes}")
                     print(f"Récompense de l'épisode : {episode_reward}")
@@ -613,10 +579,10 @@ def train_parallel(agent, envs, total_episodes = 10000, random_episodes = 1000, 
                     print(f"Epsilon : {agent.epsilon:.3f}")
                     print(f"Temps écoulé : {str(timedelta(seconds=elapsed_time))}")
 
-                    if completed_episodes >= print_step:
-                        avg_loss = np.mean(loss_list[-print_step:])
-                        avg_reward = np.mean(reward_list[-print_step:])
-                        avg_step_count = np.mean(step_count_list[-print_step:])
+                    if completed_episodes >= 10:
+                        avg_loss = np.mean(loss_list[-10:])
+                        avg_reward = np.mean(reward_list[-10:])
+                        avg_step_count = np.mean(step_count_list[-10:])
                     else:
                         avg_loss = np.mean(loss_list)
                         avg_reward = np.mean(reward_list)
@@ -836,6 +802,7 @@ def objective(trial: optuna.trial.Trial):
 
     return np.mean(reward_list)
 
+
 if __name__ == "__main__":
     """
     optuna.logging.set_verbosity(optuna.logging.DEBUG)
@@ -873,23 +840,21 @@ if __name__ == "__main__":
     train_no_parallel(agent, env, total_episodes=total_episodes, random_episodes=random_episodes, print_interval=10, save_interval=10)
     """
     
-    total_episodes = 2000
-    random_episodes = 100
-    num_envs= 64
-    epsilon=1
+    total_episodes = 10000
+    random_episodes = 1000
+    num_envs= 32
     envs = [EnvBreakout(render_mode=None, clipping=True) for _ in range(num_envs)]
     # Création de l'agent en se basant sur le premier environnement
     agent = DDQNAgent(
         state_size=envs[0].observation_space.shape[0],
         action_size=envs[0].action_space.n,
-        lr=1e-3,
+        lr=3e-4,
         batch_size=1024,
-        max_memory=100000,
-        target_update_interval=10000,
-        epsilon=epsilon,
-        epsilon_decay=compute_epsilon_decay(epsilon, 0.01, total_episodes-random_episodes-10),
-        max_grad_norm=1,
-        demo_ratio=0.8
+        max_memory=500000,
+        target_update_interval=1000,
+        epsilon_decay=compute_epsilon_decay(0.5, 0.01, total_episodes-random_episodes-1000),
+        epsilon=0.5,
+        max_grad_norm=1
     )
 
     #using pretrained weights to fasten training
@@ -902,18 +867,8 @@ if __name__ == "__main__":
     # Apply agent.RAM_Obs to each observation in transitions
     transitions = [(EnvBreakout.RAM_Obs(transition[0]), transition[1], transition[2], EnvBreakout.RAM_Obs(transition[3]), transition[4]) for transition in transitions]
 
-    #agent.load_demo_data(transitions) 
+    agent.load_demo_data(transitions) 
 
-    #train_parallel(agent=  agent, envs= envs, total_episodes=total_episodes, random_episodes=random_episodes, num_envs=num_envs, print_step=100)
-    train_no_parallel(agent, EnvBreakout(render_mode=None, clipping=True), total_episodes=total_episodes, random_episodes=random_episodes)
+    train_parallel(agent=  agent, envs= envs, total_episodes=total_episodes, random_episodes=random_episodes, num_envs=num_envs)
+    #train_no_parallel(agent, EnvBreakout(render_mode=None, clipping=True), total_episodes=total_episodes, random_episodes=random_episodes)
 
-'''
-if __name__ == '__main__':
-    agent = DDQNAgent(
-        state_size=EnvBreakout().observation_space.shape[0],
-        action_size=EnvBreakout().action_space.n, epsilon=0)
-    agent.load("checkpoint_DDQN_single")
-    print_agent_vs_env(agent=agent)
-'''
-    
-    
